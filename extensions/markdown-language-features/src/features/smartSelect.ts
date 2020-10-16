@@ -6,60 +6,56 @@
 import * as vscode from 'vscode';
 import { MarkdownEngine } from '../markdownEngine';
 import { TableOfContentsProvider } from '../tableOfContentsProvider';
-import { flatten } from '../util/arrays';
 
 export default class MarkdownSmartSelect implements vscode.SelectionRangeProvider {
 
 	constructor(
 		private readonly engine: MarkdownEngine
 	) { }
-	public async provideSelectionRanges(document: vscode.TextDocument, positions: vscode.Position[], _token: vscode.CancellationToken): Promise<vscode.SelectionRange[]> {
-		let ranges = await Promise.all([
-			await this.getHeaderSelectionRanges(document, positions),
-			await this.getBlockSelectionRanges(document, positions)
-		]);
-		let result = flatten(ranges);
-		// header will always be parent of block elements
-		// have to set the child's grandparent
-		if (result.length === 2) {
-			let parent = result[0];
-			let child = result[1];
-			let childParent = child.parent;
 
-			if (childParent) {
-				if (parent.range.contains(childParent.range)) {
-					let revisedParent = new vscode.SelectionRange(childParent.range, parent);
-					if (revisedParent.range.contains(child.range)) {
-						let res = new vscode.SelectionRange(child.range, revisedParent);
-						return [res];
+	public async provideSelectionRanges(document: vscode.TextDocument, positions: vscode.Position[], _token: vscode.CancellationToken): Promise<vscode.SelectionRange[]> {
+		let ranges: vscode.SelectionRange[] = await Promise.all(positions.map(async position => {
+			return await this.provideSelectionRange(document, position, _token);
+		}));
+		return ranges;
+	}
+
+	private async provideSelectionRange(document: vscode.TextDocument, position: vscode.Position, _token: vscode.CancellationToken): Promise<vscode.SelectionRange> {
+		let result: (vscode.SelectionRange | undefined)[] = await Promise.all([
+			await this.getHeaderSelectionRanges(document, position),
+			await this.getBlockSelectionRanges(document, position)
+		]);
+
+		let ranges: vscode.SelectionRange[] = result.filter(range => range !== undefined) as vscode.SelectionRange[];
+
+		if (ranges.length === 2) {
+			let header = ranges[0];
+			let block = ranges[1];
+			let blockParent = block.parent;
+
+			if (blockParent) {
+				if (header.range.contains(blockParent.range)) {
+					let revisedParent = new vscode.SelectionRange(blockParent.range, header);
+					if (revisedParent.range.contains(block.range)) {
+						return new vscode.SelectionRange(block.range, revisedParent);
 					}
-				}
-				else {
-					// they're one line off
-					let overlap = childParent.range.union(parent.range);
-					if (overlap) {
-						parent.range = overlap;
-					}
-					if (parent.range.contains(childParent.range)) {
-						childParent.parent = parent;
-						let res = new vscode.SelectionRange(child.range, childParent);
-						return [res];
+				} else {
+					if (header.range.contains(block.range)) {
+						return new vscode.SelectionRange(block.range, header);
 					}
 				}
 			} else {
-				if (parent.range.contains(child.range)) {
-					return [new vscode.SelectionRange(child.range, parent)];
+				if (header.range.contains(block.range)) {
+					return new vscode.SelectionRange(block.range, header);
 				}
 			}
-			return [child];
+			return block;
 		} else {
-			return result;
+			return ranges[0];
 		}
 	}
 
-	private async getBlockSelectionRanges(document: vscode.TextDocument, positions: vscode.Position[]): Promise<vscode.SelectionRange[]> {
-
-		let position = positions[0];
+	private async getBlockSelectionRanges(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.SelectionRange | undefined> {
 
 		const tokens = await this.engine.parse(document);
 
@@ -72,11 +68,10 @@ export default class MarkdownSmartSelect implements vscode.SelectionRangeProvide
 
 		if (parentToken) {
 			if (parentToken.type === 'fence') {
-				let parentRange = new vscode.SelectionRange(new vscode.Range(new vscode.Position(parentToken.map[0]-1, 0), new vscode.Position(parentToken.map[1], 0)));
+				let parentRange = new vscode.SelectionRange(new vscode.Range(new vscode.Position(parentToken.map[0] > 0 ? parentToken.map[0] - 1 : 0, 0), new vscode.Position(parentToken.map[1], 0)));
 				let childRange = new vscode.Range(new vscode.Position(parentToken.map[0] + 1, 0), new vscode.Position(parentToken.map[1] - 1, 0));
 				if (parentRange.range.contains(childRange)) {
-					let child = new vscode.SelectionRange(childRange, parentRange);
-					return [child];
+					return new vscode.SelectionRange(childRange, parentRange);
 				}
 			} else {
 				let parentRange = new vscode.SelectionRange(new vscode.Range(new vscode.Position(parentToken.map[0], 0), new vscode.Position(parentToken.map[1], 0)));
@@ -91,15 +86,14 @@ export default class MarkdownSmartSelect implements vscode.SelectionRangeProvide
 						return new vscode.SelectionRange(new vscode.Range(startPos, endPos));
 					}
 				});
-
-				return ranges.length > 0 ? [ranges[0]] : [parentRange];
+				return ranges.length > 0 ? ranges[0] : parentRange;
 			}
+		} else {
+			return undefined;
 		}
-		return [];
 	}
 
-	private async getHeaderSelectionRanges(document: vscode.TextDocument, positions: vscode.Position[]): Promise<vscode.SelectionRange[]> {
-		let position = positions[0];
+	private async getHeaderSelectionRanges(document: vscode.TextDocument, position: vscode.Position): Promise<vscode.SelectionRange | undefined> {
 		const tocProvider = new TableOfContentsProvider(this.engine, document);
 		const toc = await tocProvider.getToc();
 
@@ -108,44 +102,51 @@ export default class MarkdownSmartSelect implements vscode.SelectionRangeProvide
 		let nearbyHeaders = toc.filter(header => header.location.range.start.line <= position.line && header.location.range.end.line >= position.line);
 		let sortedHeaders = nearbyHeaders.sort((header1, header2) => (header1.line - position.line) - (header2.line - position.line));
 
-		let parentHeader = sortedHeaders.shift();
-		let parentRange: vscode.SelectionRange;
-		let currentRange: vscode.SelectionRange;
+		if (sortedHeaders.length > 0) {
 
-		if (parentHeader) {
-			let contentRange = new vscode.Range(parentHeader.location.range.start.translate(1), parentHeader.location.range.end);
-			let headerPlusContent = new vscode.SelectionRange(parentHeader.location.range);
-			if (headerPlusContent.range.contains(contentRange)) {
-				parentRange = new vscode.SelectionRange(contentRange, headerPlusContent);
-			}
-		}
-		let index = 0;
-		sortedHeaders.forEach(header => {
+			let parentHeader = sortedHeaders.shift();
+			let parentRange: vscode.SelectionRange;
+			let currentRange: vscode.SelectionRange;
+
 			if (parentHeader) {
-				let contentRange = new vscode.Range(header.location.range.start.translate(1), header.location.range.end);
-				if (parentRange.range.contains(header.location.range)) {
-					if (index === sortedHeaders.length - 1 && headerOnThisLine) {
-						currentRange = new vscode.SelectionRange(header.location.range, parentRange);
-					} else {
-						let headerPlusContent = new vscode.SelectionRange(header.location.range, parentRange);
-						currentRange = new vscode.SelectionRange(contentRange, headerPlusContent);
-					}
+				let contentRange = new vscode.Range(parentHeader.location.range.start.translate(1), parentHeader.location.range.end);
+				let headerPlusContent = new vscode.SelectionRange(parentHeader.location.range);
+				if (headerPlusContent.range.contains(contentRange)) {
+					parentRange = new vscode.SelectionRange(contentRange, headerPlusContent);
 				}
 			}
-			parentHeader = header;
-			let parentWithHeader = new vscode.SelectionRange(parentHeader.location.range, parentRange);
-			parentRange = new vscode.SelectionRange(new vscode.Range(parentHeader.location.range.start.translate(1), parentHeader.location.range.end), parentWithHeader);
-			index++;
+			let index = 0;
+			sortedHeaders.forEach(header => {
+				if (parentHeader) {
+					let contentRange = new vscode.Range(header.location.range.start.translate(1), header.location.range.end);
+					if (parentRange.range.contains(header.location.range)) {
+						if (index === sortedHeaders.length - 1 && headerOnThisLine) {
+							currentRange = new vscode.SelectionRange(header.location.range, parentRange);
+						} else {
+							let headerPlusContent = new vscode.SelectionRange(header.location.range, parentRange);
+							currentRange = new vscode.SelectionRange(contentRange, headerPlusContent);
+						}
+					}
+				}
+				parentHeader = header;
+				let parentWithHeader = new vscode.SelectionRange(parentHeader.location.range, parentRange);
+				parentRange = new vscode.SelectionRange(new vscode.Range(parentHeader.location.range.start.translate(1), parentHeader.location.range.end), parentWithHeader);
+				index++;
+			}
+			);
+			if (!currentRange && parentRange) {
+				return parentRange;
+			}
+			return currentRange;
+		} else {
+			return undefined;
 		}
-		);
-		if (!currentRange && parentRange) {
-			return [parentRange];
-		}
-		return [currentRange];
 	}
 }
 
 let getEndCharacter = (document: vscode.TextDocument, startLine: number, endLine: number): number => {
-	let endChar = Math.max(document.lineAt(startLine).text.length, document.lineAt(endLine).text.length)
+	let startLength = document.lineAt(startLine).text ? document.lineAt(startLine).text.length : 0;
+	let endLength = document.lineAt(startLine).text ? document.lineAt(startLine).text.length : 0;
+	let endChar = Math.max(startLength, endLength);
 	return startLine !== endLine ? 0 : endChar;
 };
